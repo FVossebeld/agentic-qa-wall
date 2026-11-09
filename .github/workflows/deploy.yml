@@ -1,0 +1,81 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "public/**"
+      - "package.json"
+      - "package-lock.json"
+      - "Dockerfile"
+  workflow_dispatch:
+    inputs:
+      login_check:
+        description: "Only verify the Azure login (OIDC) and exit"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ vars.ACR_LOGIN_SERVER }}/qa-wall:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for app
+        id: app
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Dockerfile yet, so there is nothing to deploy."
+          fi
+
+      - name: Azure login (OIDC)
+        if: steps.app.outputs.present == 'true' || inputs.login_check
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify access
+        if: inputs.login_check
+        run: az containerapp show -n "${{ vars.CONTAINER_APP_NAME }}" -g "${{ vars.RESOURCE_GROUP }}" --query properties.provisioningState -o tsv
+
+      - name: Build and push image
+        if: steps.app.outputs.present == 'true' && !inputs.login_check
+        run: |
+          az acr login --name "${{ vars.ACR_NAME }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy to Azure Container Apps (Sweden Central)
+        if: steps.app.outputs.present == 'true' && !inputs.login_check
+        run: az containerapp update -n "${{ vars.CONTAINER_APP_NAME }}" -g "${{ vars.RESOURCE_GROUP }}" --image "$IMAGE" -o none
+
+      - name: Smoke test
+        if: steps.app.outputs.present == 'true' && !inputs.login_check
+        run: |
+          URL="${{ vars.APP_URL }}"
+          for i in $(seq 1 30); do
+            if curl -fsS "$URL/healthz"; then
+              echo
+              echo "### 🚀 Live at $URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Health check failed at $URL/healthz"
+          exit 1

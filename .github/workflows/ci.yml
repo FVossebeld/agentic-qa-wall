@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for app
+        id: app
+        run: |
+          if [ -f package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No package.json yet, so there is nothing to build."
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.app.outputs.present == 'true'
+        with:
+          node-version: 22
+
+      - name: Install
+        if: steps.app.outputs.present == 'true'
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: Build
+        if: steps.app.outputs.present == 'true'
+        run: npm run build
+
+      - name: Test
+        if: steps.app.outputs.present == 'true'
+        run: npm test
+
+      - name: Container smoke test
+        if: steps.app.outputs.present == 'true'
+        run: |
+          docker build -t qa-wall:ci .
+          docker run -d --name qa -p 8080:8080 -e PRESENTER_KEY=ci-key -e EVENT_TITLE=CI qa-wall:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:8080/healthz; then echo; exit 0; fi
+            sleep 1
+          done
+          docker logs qa
+          exit 1
